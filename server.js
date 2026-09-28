@@ -8,6 +8,8 @@ const FRONTEND = path.resolve(process.env.FRONTEND_DIR || path.join(__dirname, '
 const PORT = +process.env.PORT || 3000, HOST = process.env.HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
 const SECURE = process.env.COOKIE_SECURE === '1';
 const SESSION_MS = 7 * 24 * 3600 * 1000, MAX_BODY = 6 * 1024 * 1024;
+// โดเมนหน้าเว็บที่อนุญาตให้เรียก API ข้ามโดเมน เช่น https://breakerxxx90.github.io (คั่นด้วย , ได้หลายตัว)
+const ALLOWED = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
 
 // ---------- ตัวช่วยพื้นฐาน ----------
 class HttpError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
@@ -72,21 +74,23 @@ async function parseBody(req) {
 
 const cookies = req => Object.fromEntries((req.headers.cookie || '').split(';').map(s => s.trim().split(/=(.*)/s).slice(0, 2)).filter(a => a[0]));
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
+const tokenOf = req => { const m = /^Bearer (.+)$/i.exec(req.headers.authorization || ''); return m ? m[1].trim() : cookies(req).sid; };
 
 // ---------- session / สิทธิ์ ----------
 async function userFrom(req) {
-  const t = cookies(req).sid;
+  const t = tokenOf(req);
   if (!t) return null;
   return db.get('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?', sha(t), Date.now());
 }
 async function startSession(ctx, uid) {
   const t = crypto.randomBytes(32).toString('hex');
+  ctx.token = t;
   await db.run('DELETE FROM sessions WHERE expires<?', Date.now());
   await db.run('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)', sha(t), uid, Date.now() + SESSION_MS);
   ctx.cookie = `sid=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_MS / 1000}${SECURE ? '; Secure' : ''}`;
 }
 async function endSession(ctx) {
-  const t = cookies(ctx.req).sid;
+  const t = tokenOf(ctx.req);
   if (t) await db.run('DELETE FROM sessions WHERE token=?', sha(t));
   ctx.cookie = `sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${SECURE ? '; Secure' : ''}`;
 }
@@ -111,7 +115,7 @@ async function doLogin(ctx, adminOnly) {
   }
   if (adminOnly && u.role !== 'admin') fail(403, 'บัญชีนี้ไม่ใช่ผู้ดูแลระบบ');
   await startSession(ctx, u.id);
-  return { user: pub(u) };
+  return { user: pub(u), token: ctx.token };
 }
 route('POST', '/api/auth/login', null, ctx => doLogin(ctx, false));
 route('POST', '/api/auth/admin-login', null, ctx => doLogin(ctx, true));
@@ -123,7 +127,7 @@ route('POST', '/api/auth/signup', null, async ctx => {
   try { u = (await db.run('INSERT INTO users(username,password_hash,name) VALUES(?,?,?) RETURNING *', un, await hashPassword(pw), un)).rows[0]; }
   catch (e) { if (e.code === '23505') fail(409, 'ชื่อผู้ใช้นี้ถูกใช้แล้ว'); throw e; }
   await startSession(ctx, u.id);
-  return R(201, { user: pub(u) });
+  return R(201, { user: pub(u), token: ctx.token });
 });
 route('POST', '/api/auth/logout', null, async ctx => { await endSession(ctx); return { ok: true }; });
 route('GET', '/api/me', 'user', ctx => pub(ctx.user));
@@ -285,12 +289,21 @@ async function serveUpload(req, res, name) {
 const server = http.createServer(async (req, res) => {
   const ctx = { req, cookie: null };
   try {
+    const origin = req.headers.origin;
+    if (origin && ALLOWED.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Max-Age', '86400');
+    }
+    if (req.method === 'OPTIONS') { res.writeHead(204, SEC); return res.end(); }
     const url = new URL(req.url, 'http://x'), p = decodeURIComponent(url.pathname);
     ctx.query = url.searchParams;
     ctx.user = await userFrom(req);
 
     if (!['GET', 'HEAD'].includes(req.method) && req.headers.origin) {   // กัน CSRF เพิ่มอีกชั้น
-      let ok = false; try { ok = new URL(req.headers.origin).host === req.headers.host; } catch {}
+      let ok = ALLOWED.includes(req.headers.origin); try { ok = ok || new URL(req.headers.origin).host === req.headers.host; } catch {}
       if (!ok) fail(403);
     }
 
@@ -307,7 +320,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (!['GET', 'HEAD'].includes(req.method)) fail(404);
-    if (p === '/') return serveFile(req, res, FRONTEND, '/index.html');
+    if (p === '/') {
+      if (process.env.FRONTEND_URL) return redirect(res, process.env.FRONTEND_URL);
+      if (fs.existsSync(path.join(FRONTEND, 'index.html'))) return serveFile(req, res, FRONTEND, '/index.html');
+      return sendJson(res, 200, { ok: true, service: 'ceo-backend' });
+    }
     if (USER_PAGES.has(p) && !ctx.user) return redirect(res, '/login.html');
     if (p === '/admin.html' && (!ctx.user || ctx.user.role !== 'admin')) return redirect(res, '/admin-login.html');
     if (p.startsWith('/uploads/')) return await serveUpload(req, res, path.basename(p));
